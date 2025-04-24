@@ -355,6 +355,8 @@ class RectifiedFlow(Module):
         # start with random gaussian noise - y0
 
         noise = default(noise, torch.randn((batch_size, *data_shape), device = self.device))
+        
+        import pdb; pdb.set_trace()
 
         # time steps
 
@@ -369,6 +371,76 @@ class RectifiedFlow(Module):
         self.train(was_training)
 
         return self.data_unnormalize_fn(sampled_data)
+    
+    
+    @torch.no_grad()
+    def reverse(
+        self,
+        data,
+        #batch_size = 1,
+        steps = 16,
+        noise = None,
+       # data_shape: tuple[int, ...] | None = None,
+        use_ema: bool = False,
+        **model_kwargs
+    ):
+        data = data.to(self.device)
+        data = self.data_normalize_fn(data)
+        batch_size = data.shape[0]
+        data_shape = data.shape[1:]
+        
+        use_ema = default(use_ema, self.use_consistency)
+        assert not (use_ema and not self.use_consistency), 'in order to sample from an ema model, you must have `use_consistency` turned on'
+
+        model = self.ema_model if use_ema else self.model
+
+        was_training = self.training
+        self.eval()
+
+        data_shape = default(data_shape, self.data_shape)
+        assert exists(data_shape), 'you need to either pass in a `data_shape` or have trained at least with one forward'
+
+        # clipping still helps for predict noise objective
+        # much like original ddpm paper trick
+        maybe_clip = (lambda t: t.clamp_(*self.clip_values)) if self.clip_during_sampling else identity
+        maybe_clip_flow = (lambda t: t.clamp_(*self.clip_flow_values)) if self.clip_flow_during_sampling else identity
+
+        # ode step function
+        def ode_fn(t, x):
+            x = maybe_clip(x)
+
+            _, output = self.predict_flow(model, x, times = t, **model_kwargs)
+
+            flow = output
+
+            if self.mean_variance_net:
+                mean, variance = output.unbind(dim = 2)
+                flow = torch.normal(mean, variance)
+
+            flow = maybe_clip_flow(flow)
+
+            return -flow
+
+        # start with images x1
+
+        noise = default(noise, torch.randn((batch_size, *data_shape), device = self.device))
+      
+        # time steps, go from 1->0, for the reverse procs, we might have to 
+        #have more number of steps, to avoid discretization errors?
+        #for now , lets have same number of steps, starting t=1-->t=0
+        times = torch.linspace(1.0, 0.0, steps, device=self.device)
+        #times = torch.linspace(0., 1., steps, device = self.device)
+
+        # ode
+
+        trajectory = odeint(ode_fn, noise, times, **self.odeint_kwargs)
+
+        noise = trajectory[-1]
+
+        #i think this is not nessasary, here, just keeping here
+        self.train(was_training)
+
+        return noise
 
     def forward(
         self,
